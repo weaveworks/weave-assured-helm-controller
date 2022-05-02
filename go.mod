@@ -13,6 +13,7 @@ require (
 	github.com/fluxcd/source-controller/api v0.29.0
 	github.com/go-logr/logr v1.2.3
 	github.com/hashicorp/go-retryablehttp v0.7.1
+	github.com/mitchellh/copystructure v1.2.0
 	github.com/onsi/gomega v1.20.2
 	github.com/spf13/pflag v1.0.5
 	helm.sh/helm/v3 v3.9.4
@@ -105,7 +106,6 @@ require (
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/mattn/go-runewidth v0.0.9 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.2-0.20181231171920-c182affec369 // indirect
-	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/moby/locker v1.0.1 // indirect
