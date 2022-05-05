@@ -18,17 +18,17 @@ package controllers
 
 import (
 	"context"
-	"reflect"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
-	"helm.sh/helm/v3/pkg/chartutil"
-	corev1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
@@ -37,246 +37,102 @@ import (
 	sourcev1 "github.com/fluxcd/source-controller/api/v1beta2"
 )
 
-func TestHelmReleaseReconciler_composeValues(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = v2.AddToScheme(scheme)
+func TestHelmReleaseReconciler_getHelmChart(t *testing.T) {
+	g := NewWithT(t)
 
-	tests := []struct {
-		name       string
-		resources  []runtime.Object
-		references []v2.ValuesReference
-		values     string
-		want       chartutil.Values
-		wantErr    bool
-	}{
-		{
-			name: "merges",
-			resources: []runtime.Object{
-				valuesConfigMap("values", map[string]string{
-					"values.yaml": `flat: value
-nested:
-  configuration: value
-`,
-				}),
-				valuesSecret("values", map[string][]byte{
-					"values.yaml": []byte(`flat:
-  nested: value
-nested: value
-`),
-				}),
-			},
-			references: []v2.ValuesReference{
-				{
-					Kind: "ConfigMap",
-					Name: "values",
-				},
-				{
-					Kind: "Secret",
-					Name: "values",
-				},
-			},
-			values: `
-other: values
-`,
-			want: chartutil.Values{
-				"flat": map[string]interface{}{
-					"nested": "value",
-				},
-				"nested": "value",
-				"other":  "values",
-			},
-		},
-		{
-			name: "target path",
-			resources: []runtime.Object{
-				valuesSecret("values", map[string][]byte{"single": []byte("value")}),
-			},
-			references: []v2.ValuesReference{
-				{
-					Kind:       "Secret",
-					Name:       "values",
-					ValuesKey:  "single",
-					TargetPath: "merge.at.specific.path",
-				},
-			},
-			want: chartutil.Values{
-				"merge": map[string]interface{}{
-					"at": map[string]interface{}{
-						"specific": map[string]interface{}{
-							"path": "value",
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "target path with boolean value",
-			resources: []runtime.Object{
-				valuesSecret("values", map[string][]byte{"single": []byte("true")}),
-			},
-			references: []v2.ValuesReference{
-				{
-					Kind:       "Secret",
-					Name:       "values",
-					ValuesKey:  "single",
-					TargetPath: "merge.at.specific.path",
-				},
-			},
-			want: chartutil.Values{
-				"merge": map[string]interface{}{
-					"at": map[string]interface{}{
-						"specific": map[string]interface{}{
-							"path": true,
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "target path with set-string behavior",
-			resources: []runtime.Object{
-				valuesSecret("values", map[string][]byte{"single": []byte("\"true\"")}),
-			},
-			references: []v2.ValuesReference{
-				{
-					Kind:       "Secret",
-					Name:       "values",
-					ValuesKey:  "single",
-					TargetPath: "merge.at.specific.path",
-				},
-			},
-			want: chartutil.Values{
-				"merge": map[string]interface{}{
-					"at": map[string]interface{}{
-						"specific": map[string]interface{}{
-							"path": "true",
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "values reference to non existing secret",
-			references: []v2.ValuesReference{
-				{
-					Kind: "Secret",
-					Name: "missing",
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "optional values reference to non existing secret",
-			references: []v2.ValuesReference{
-				{
-					Kind:     "Secret",
-					Name:     "missing",
-					Optional: true,
-				},
-			},
-			want:    chartutil.Values{},
-			wantErr: false,
-		},
-		{
-			name: "values reference to non existing config map",
-			references: []v2.ValuesReference{
-				{
-					Kind: "ConfigMap",
-					Name: "missing",
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "optional values reference to non existing config map",
-			references: []v2.ValuesReference{
-				{
-					Kind:     "ConfigMap",
-					Name:     "missing",
-					Optional: true,
-				},
-			},
-			want:    chartutil.Values{},
-			wantErr: false,
-		},
-		{
-			name: "missing secret key",
-			resources: []runtime.Object{
-				valuesSecret("values", nil),
-			},
-			references: []v2.ValuesReference{
-				{
-					Kind:      "Secret",
-					Name:      "values",
-					ValuesKey: "nonexisting",
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "missing config map key",
-			resources: []runtime.Object{
-				valuesConfigMap("values", nil),
-			},
-			references: []v2.ValuesReference{
-				{
-					Kind:      "ConfigMap",
-					Name:      "values",
-					ValuesKey: "nonexisting",
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "unsupported values reference kind",
-			references: []v2.ValuesReference{
-				{
-					Kind: "Unsupported",
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "invalid values",
-			resources: []runtime.Object{
-				valuesConfigMap("values", map[string]string{
-					"values.yaml": `
-invalid`,
-				}),
-			},
-			references: []v2.ValuesReference{
-				{
-					Kind: "ConfigMap",
-					Name: "values",
-				},
-			},
-			wantErr: true,
+	scheme := runtime.NewScheme()
+	g.Expect(v2.AddToScheme(scheme)).To(Succeed())
+	g.Expect(sourcev1.AddToScheme(scheme)).To(Succeed())
+
+	chart := &sourcev1.HelmChart{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "some-namespace",
+			Name:      "some-chart-name",
 		},
 	}
 
+	tests := []struct {
+		name            string
+		rel             *v2.HelmRelease
+		chart           *sourcev1.HelmChart
+		expectChart     bool
+		wantErr         bool
+		disallowCrossNS bool
+	}{
+		{
+			name: "retrieves HelmChart object from Status",
+			rel: &v2.HelmRelease{
+				Status: v2.HelmReleaseStatus{
+					HelmChart: "some-namespace/some-chart-name",
+				},
+			},
+			chart:       chart,
+			expectChart: true,
+		},
+		{
+			name: "no HelmChart found",
+			rel: &v2.HelmRelease{
+				Status: v2.HelmReleaseStatus{
+					HelmChart: "some-namespace/some-chart-name",
+				},
+			},
+			chart:       nil,
+			expectChart: false,
+			wantErr:     true,
+		},
+		{
+			name: "no HelmChart in Status",
+			rel: &v2.HelmRelease{
+				Status: v2.HelmReleaseStatus{
+					HelmChart: "",
+				},
+			},
+			chart:       chart,
+			expectChart: false,
+			wantErr:     true,
+		},
+		{
+			name: "ACL disallows cross namespace",
+			rel: &v2.HelmRelease{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+				},
+				Status: v2.HelmReleaseStatus{
+					HelmChart: "some-namespace/some-chart-name",
+				},
+			},
+			chart:           chart,
+			expectChart:     false,
+			wantErr:         true,
+			disallowCrossNS: true,
+		},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := fake.NewFakeClientWithScheme(scheme, tt.resources...)
-			r := &HelmReleaseReconciler{Client: c}
-			var values *apiextensionsv1.JSON
-			if tt.values != "" {
-				v, _ := yaml.YAMLToJSON([]byte(tt.values))
-				values = &apiextensionsv1.JSON{Raw: v}
+			builder := fake.NewClientBuilder()
+			builder.WithScheme(scheme)
+			if tt.chart != nil {
+				builder.WithObjects(tt.chart)
 			}
-			hr := v2.HelmRelease{
-				Spec: v2.HelmReleaseSpec{
-					ValuesFrom: tt.references,
-					Values:     values,
-				},
+
+			r := &HelmReleaseReconciler{
+				Client:              builder.Build(),
+				EventRecorder:       record.NewFakeRecorder(32),
+				NoCrossNamespaceRef: tt.disallowCrossNS,
 			}
-			got, err := r.composeValues(logr.NewContext(context.TODO(), logr.Discard()), hr)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("composeValues() error = %v, wantErr %v", err, tt.wantErr)
+
+			got, err := r.getHelmChart(context.TODO(), tt.rel)
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(got).To(BeNil())
 				return
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("composeValues() got = %v, want %v", got, tt.want)
+			g.Expect(err).ToNot(HaveOccurred())
+			expect := g.Expect(got.ObjectMeta)
+			if tt.expectChart {
+				expect.To(BeEquivalentTo(tt.chart.ObjectMeta))
+			} else {
+				expect.To(BeNil())
 			}
 		})
 	}
@@ -445,145 +301,6 @@ func TestValuesReferenceValidation(t *testing.T) {
 			}
 		})
 	}
-}
-
-func FuzzHelmReleaseReconciler_composeValues(f *testing.F) {
-	scheme := testScheme()
-
-	tests := []struct {
-		targetPath   string
-		valuesKey    string
-		hrValues     string
-		createObject bool
-		secretData   []byte
-		configData   string
-	}{
-		{
-			targetPath: "flat",
-			valuesKey:  "custom-values.yaml",
-			secretData: []byte(`flat:
-  nested: value
-nested: value
-`),
-			configData: `flat: value
-nested:
-  configuration: value
-`,
-			hrValues: `
-other: values
-`,
-			createObject: true,
-		},
-		{
-			targetPath: "'flat'",
-			valuesKey:  "custom-values.yaml",
-			secretData: []byte(`flat:
-  nested: value
-nested: value
-`),
-			configData: `flat: value
-nested:
-  configuration: value
-`,
-			hrValues: `
-other: values
-`,
-			createObject: true,
-		},
-		{
-			targetPath: "flat[0]",
-			secretData: []byte(``),
-			configData: `flat: value`,
-			hrValues: `
-other: values
-`,
-			createObject: true,
-		},
-		{
-			secretData: []byte(`flat:
-  nested: value
-nested: value
-`),
-			configData: `flat: value
-nested:
-  configuration: value
-`,
-			hrValues: `
-other: values
-`,
-			createObject: true,
-		},
-		{
-			targetPath: "some-value",
-			hrValues: `
-other: values
-`,
-			createObject: false,
-		},
-	}
-
-	for _, tt := range tests {
-		f.Add(tt.targetPath, tt.valuesKey, tt.hrValues, tt.createObject, tt.secretData, tt.configData)
-	}
-
-	f.Fuzz(func(t *testing.T,
-		targetPath, valuesKey, hrValues string, createObject bool, secretData []byte, configData string) {
-
-		// objectName represents a core Kubernetes name (Secret/ConfigMap) which is validated
-		// upstream, and also validated by us in the OpenAPI-based validation set in
-		// v2.ValuesReference. Therefore a static value here suffices, and instead we just
-		// play with the objects presence/absence.
-		objectName := "values"
-		resources := []runtime.Object{}
-
-		if createObject {
-			resources = append(resources,
-				valuesConfigMap(objectName, map[string]string{valuesKey: configData}),
-				valuesSecret(objectName, map[string][]byte{valuesKey: secretData}),
-			)
-		}
-
-		references := []v2.ValuesReference{
-			{
-				Kind:       "ConfigMap",
-				Name:       objectName,
-				ValuesKey:  valuesKey,
-				TargetPath: targetPath,
-			},
-			{
-				Kind:       "Secret",
-				Name:       objectName,
-				ValuesKey:  valuesKey,
-				TargetPath: targetPath,
-			},
-		}
-
-		c := fake.NewFakeClientWithScheme(scheme, resources...)
-		r := &HelmReleaseReconciler{Client: c}
-		var values *apiextensionsv1.JSON
-		if hrValues != "" {
-			v, _ := yaml.YAMLToJSON([]byte(hrValues))
-			values = &apiextensionsv1.JSON{Raw: v}
-		}
-
-		hr := v2.HelmRelease{
-			Spec: v2.HelmReleaseSpec{
-				ValuesFrom: references,
-				Values:     values,
-			},
-		}
-
-		// OpenAPI-based validation on schema is not verified here.
-		// Therefore some false positives may be arise, as the apiserver
-		// would not allow such values to make their way into the control plane.
-		//
-		// Testenv could be used so the fuzzing covers the entire E2E.
-		// The downsize being the resource and time cost per test would be a lot higher.
-		//
-		// Another approach could be to add validation to reject invalid inputs before
-		// the r.composeValues call.
-		_, _ = r.composeValues(logr.NewContext(context.TODO(), logr.Discard()), hr)
-	})
 }
 
 func FuzzHelmReleaseReconciler_reconcile(f *testing.F) {

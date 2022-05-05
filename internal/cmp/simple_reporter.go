@@ -31,15 +31,16 @@ type SimpleReporter struct {
 }
 
 // Report writes a diff entry if rs is not equal. In the format of:
-//  Path:
-//  -old
-//  +new
 //
-//  Path.Nested:
-//  -removed
+//	Path:
+//	-old
+//	+new
 //
-//  Path.Other:
-//  +added
+//	Path.Nested:
+//	-removed
+//
+//	Path.Other:
+//	+added
 func (r *SimpleReporter) Report(rs cmp.Result) {
 	if !rs.Equal() {
 		vx, vy := r.path.Last().Values()
