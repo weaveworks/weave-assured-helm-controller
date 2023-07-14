@@ -23,23 +23,32 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fluxcd/pkg/runtime/conditions"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	helmrelease "helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/releaseutil"
 	helmstorage "helm.sh/helm/v3/pkg/storage"
 	helmdriver "helm.sh/helm/v3/pkg/storage/driver"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
+
+	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
+	"github.com/fluxcd/pkg/apis/meta"
+	"github.com/fluxcd/pkg/runtime/conditions"
 
 	v2 "github.com/fluxcd/helm-controller/api/v2beta2"
 	"github.com/fluxcd/helm-controller/internal/action"
+	"github.com/fluxcd/helm-controller/internal/chartutil"
+	"github.com/fluxcd/helm-controller/internal/digest"
 	"github.com/fluxcd/helm-controller/internal/release"
 	"github.com/fluxcd/helm-controller/internal/storage"
 	"github.com/fluxcd/helm-controller/internal/testutil"
 )
 
-func Test_uninstall(t *testing.T) {
+func TestUninstall_Reconcile(t *testing.T) {
+	mockUpdateErr := errors.New("mock update error")
+
 	tests := []struct {
 		name string
 		// driver allows for modifying the Helm storage driver.
@@ -95,8 +104,10 @@ func Test_uninstall(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
-				*conditions.TrueCondition(v2.RemediatedCondition, v2.UninstallSucceededReason,
-					"Uninstallation complete"),
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UninstallSucceededReason,
+					"Uninstalled release"),
+				*conditions.FalseCondition(v2.ReleasedCondition, v2.UninstallSucceededReason,
+					"Uninstalled release"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				return release.ObservedToInfo(release.ObserveRelease(releases[0]))
@@ -126,13 +137,61 @@ func Test_uninstall(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
-				*conditions.FalseCondition(v2.RemediatedCondition, v2.UninstallFailedReason,
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UninstallFailedReason,
+					"uninstallation completed with 1 error(s): 1 error occurred:\n\t* timed out waiting for the condition\n\n"),
+				*conditions.FalseCondition(v2.ReleasedCondition, v2.UninstallFailedReason,
 					"uninstallation completed with 1 error(s): 1 error occurred:\n\t* timed out waiting for the condition\n\n"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				return release.ObservedToInfo(release.ObserveRelease(releases[0]))
 			},
 			expectFailures: 1,
+		},
+		{
+			name: "uninstall failure without storage update",
+			driver: func(driver helmdriver.Driver) helmdriver.Driver {
+				return &storage.Failing{
+					// Explicitly inherit the driver, as we want to rely on the
+					// Secret storage, as the memory storage does not detach
+					// objects from the release action. Causing writes post-persist
+					// to leak to the stored release object.
+					// xref: https://github.com/helm/helm/issues/11304
+					Driver:    driver,
+					UpdateErr: mockUpdateErr,
+				}
+			},
+			releases: func(namespace string) []*helmrelease.Release {
+				return []*helmrelease.Release{
+					testutil.BuildRelease(&helmrelease.MockReleaseOptions{
+						Name:      mockReleaseName,
+						Namespace: namespace,
+						Version:   1,
+						Chart:     testutil.BuildChart(testutil.ChartWithTestHook()),
+						Status:    helmrelease.StatusDeployed,
+					}),
+				}
+			},
+			spec: func(spec *v2.HelmReleaseSpec) {
+				spec.Uninstall = &v2.Uninstall{
+					KeepHistory: true,
+				}
+			},
+			status: func(releases []*helmrelease.Release) v2.HelmReleaseStatus {
+				return v2.HelmReleaseStatus{
+					Current: release.ObservedToInfo(release.ObserveRelease(releases[0])),
+				}
+			},
+			expectConditions: []metav1.Condition{
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UninstallFailedReason,
+					ErrNoStorageUpdate.Error()),
+				*conditions.FalseCondition(v2.ReleasedCondition, v2.UninstallFailedReason,
+					ErrNoStorageUpdate.Error()),
+			},
+			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
+				return release.ObservedToInfo(release.ObserveRelease(releases[0]))
+			},
+			expectFailures: 1,
+			wantErr:        ErrNoStorageUpdate,
 		},
 		{
 			name: "uninstall failure without storage delete",
@@ -142,6 +201,7 @@ func Test_uninstall(t *testing.T) {
 					// Secret storage, as the memory storage does not detach
 					// objects from the release action. Causing writes post-persist
 					// to leak to the stored release object.
+					// xref: https://github.com/helm/helm/issues/11304
 					Driver:    driver,
 					DeleteErr: fmt.Errorf("delete error"),
 				}
@@ -163,7 +223,9 @@ func Test_uninstall(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
-				*conditions.FalseCondition(v2.RemediatedCondition, v2.UninstallFailedReason,
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UninstallFailedReason,
+					"delete error"),
+				*conditions.FalseCondition(v2.ReleasedCondition, v2.UninstallFailedReason,
 					"delete error"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
@@ -218,13 +280,16 @@ func Test_uninstall(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
-				*conditions.FalseCondition(v2.RemediatedCondition, v2.UninstallFailedReason,
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UninstallFailedReason,
+					ErrReleaseMismatch.Error()),
+				*conditions.FalseCondition(v2.ReleasedCondition, v2.UninstallFailedReason,
 					ErrReleaseMismatch.Error()),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				return release.ObservedToInfo(release.ObserveRelease(releases[0]))
 			},
 			expectFailures: 1,
+			wantErr:        ErrReleaseMismatch,
 		},
 	}
 	for _, tt := range tests {
@@ -277,7 +342,8 @@ func Test_uninstall(t *testing.T) {
 				cfg.Driver = tt.driver(cfg.Driver)
 			}
 
-			got := (&Uninstall{configFactory: cfg}).Reconcile(context.TODO(), &Request{
+			recorder := new(record.FakeRecorder)
+			got := NewUninstall(cfg, recorder).Reconcile(context.TODO(), &Request{
 				Object: obj,
 			})
 			if tt.wantErr != nil {
@@ -292,15 +358,15 @@ func Test_uninstall(t *testing.T) {
 			releaseutil.SortByRevision(releases)
 
 			if tt.expectCurrent != nil {
-				g.Expect(obj.Status.Current).To(testutil.Equal(tt.expectCurrent(releases)))
+				g.Expect(obj.GetCurrent()).To(testutil.Equal(tt.expectCurrent(releases)))
 			} else {
-				g.Expect(obj.Status.Current).To(BeNil(), "expected current to be nil")
+				g.Expect(obj.GetCurrent()).To(BeNil(), "expected current to be nil")
 			}
 
 			if tt.expectPrevious != nil {
-				g.Expect(obj.Status.Previous).To(testutil.Equal(tt.expectPrevious(releases)))
+				g.Expect(obj.GetPrevious()).To(testutil.Equal(tt.expectPrevious(releases)))
 			} else {
-				g.Expect(obj.Status.Previous).To(BeNil(), "expected previous to be nil")
+				g.Expect(obj.GetPrevious()).To(BeNil(), "expected previous to be nil")
 			}
 
 			g.Expect(obj.Status.Failures).To(Equal(tt.expectFailures))
@@ -308,6 +374,123 @@ func Test_uninstall(t *testing.T) {
 			g.Expect(obj.Status.UpgradeFailures).To(Equal(tt.expectUpgradeFailures))
 		})
 	}
+}
+
+func TestUninstall_failure(t *testing.T) {
+	var (
+		cur = testutil.BuildRelease(&helmrelease.MockReleaseOptions{
+			Name:    mockReleaseName,
+			Chart:   testutil.BuildChart(),
+			Version: 4,
+		})
+		obj = &v2.HelmRelease{
+			Status: v2.HelmReleaseStatus{
+				Current: release.ObservedToInfo(release.ObserveRelease(cur)),
+			},
+		}
+		err = errors.New("uninstall error")
+	)
+
+	t.Run("records failure", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Uninstall{
+			eventRecorder: recorder,
+		}
+
+		req := &Request{Object: obj.DeepCopy()}
+		r.failure(req, nil, err)
+
+		expectMsg := fmt.Sprintf(fmtUninstallFailure,
+			fmt.Sprintf("%s/%s.%d", cur.Namespace, cur.Name, cur.Version),
+			fmt.Sprintf("%s@%s", cur.Chart.Name(), cur.Chart.Metadata.Version),
+			err.Error())
+
+		g.Expect(req.Object.Status.Conditions).To(conditions.MatchConditions([]metav1.Condition{
+			*conditions.FalseCondition(v2.ReleasedCondition, v2.UninstallFailedReason, expectMsg),
+		}))
+		g.Expect(req.Object.Status.Failures).To(Equal(int64(1)))
+		g.Expect(recorder.GetEvents()).To(ConsistOf([]corev1.Event{
+			{
+				Type:    corev1.EventTypeWarning,
+				Reason:  v2.UninstallFailedReason,
+				Message: expectMsg,
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						eventMetaGroupKey(eventv1.MetaRevisionKey): cur.Chart.Metadata.Version,
+						eventMetaGroupKey(eventv1.MetaTokenKey):    chartutil.DigestValues(digest.Canonical, cur.Config).String(),
+					},
+				},
+			},
+		}))
+	})
+
+	t.Run("records failure with logs", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Uninstall{
+			eventRecorder: recorder,
+		}
+		req := &Request{Object: obj.DeepCopy()}
+		r.failure(req, mockLogBuffer(5, 10), err)
+
+		expectSubStr := "Last Helm logs"
+		g.Expect(conditions.IsFalse(req.Object, v2.ReleasedCondition)).To(BeTrue())
+		g.Expect(conditions.GetMessage(req.Object, v2.ReleasedCondition)).ToNot(ContainSubstring(expectSubStr))
+
+		events := recorder.GetEvents()
+		g.Expect(events).To(HaveLen(1))
+		g.Expect(events[0].Message).To(ContainSubstring(expectSubStr))
+	})
+}
+
+func TestUninstall_success(t *testing.T) {
+	g := NewWithT(t)
+
+	var cur = testutil.BuildRelease(&helmrelease.MockReleaseOptions{
+		Name:      mockReleaseName,
+		Namespace: mockReleaseNamespace,
+		Chart:     testutil.BuildChart(),
+		Version:   4,
+	})
+
+	recorder := testutil.NewFakeRecorder(10, false)
+	r := &Uninstall{
+		eventRecorder: recorder,
+	}
+
+	obj := &v2.HelmRelease{
+		Status: v2.HelmReleaseStatus{
+			Current: release.ObservedToInfo(release.ObserveRelease(cur)),
+		},
+	}
+
+	req := &Request{Object: obj}
+	r.success(req)
+
+	expectMsg := fmt.Sprintf(fmtUninstallSuccess,
+		fmt.Sprintf("%s/%s.%d", cur.Namespace, cur.Name, cur.Version),
+		fmt.Sprintf("%s@%s", cur.Chart.Name(), cur.Chart.Metadata.Version))
+
+	g.Expect(req.Object.Status.Conditions).To(conditions.MatchConditions([]metav1.Condition{
+		*conditions.FalseCondition(v2.ReleasedCondition, v2.UninstallSucceededReason, expectMsg),
+	}))
+	g.Expect(req.Object.Status.Failures).To(Equal(int64(0)))
+	g.Expect(recorder.GetEvents()).To(ConsistOf([]corev1.Event{
+		{
+			Type:    corev1.EventTypeNormal,
+			Reason:  v2.UninstallSucceededReason,
+			Message: expectMsg,
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					eventMetaGroupKey(eventv1.MetaRevisionKey): cur.Chart.Metadata.Version,
+					eventMetaGroupKey(eventv1.MetaTokenKey):    chartutil.DigestValues(digest.Canonical, cur.Config).String(),
+				},
+			},
+		},
+	}))
 }
 
 func Test_observeUninstall(t *testing.T) {
@@ -334,9 +517,9 @@ func Test_observeUninstall(t *testing.T) {
 		expect := release.ObservedToInfo(release.ObserveRelease(rls))
 
 		observeUninstall(obj)(rls)
-		g.Expect(obj.Status.Current).ToNot(BeNil())
-		g.Expect(obj.Status.Current).To(Equal(expect))
-		g.Expect(obj.Status.Previous).To(BeNil())
+		g.Expect(obj.GetCurrent()).ToNot(BeNil())
+		g.Expect(obj.GetCurrent()).To(Equal(expect))
+		g.Expect(obj.GetPrevious()).To(BeNil())
 	})
 
 	t.Run("uninstall without current", func(t *testing.T) {
@@ -355,8 +538,8 @@ func Test_observeUninstall(t *testing.T) {
 		})
 
 		observeUninstall(obj)(rls)
-		g.Expect(obj.Status.Current).To(BeNil())
-		g.Expect(obj.Status.Previous).To(BeNil())
+		g.Expect(obj.GetCurrent()).To(BeNil())
+		g.Expect(obj.GetPrevious()).To(BeNil())
 	})
 
 	t.Run("uninstall of different version than current", func(t *testing.T) {
@@ -381,8 +564,8 @@ func Test_observeUninstall(t *testing.T) {
 		})
 
 		observeUninstall(obj)(rls)
-		g.Expect(obj.Status.Current).ToNot(BeNil())
-		g.Expect(obj.Status.Current).To(Equal(current))
-		g.Expect(obj.Status.Previous).To(BeNil())
+		g.Expect(obj.GetCurrent()).ToNot(BeNil())
+		g.Expect(obj.GetCurrent()).To(Equal(current))
+		g.Expect(obj.GetPrevious()).To(BeNil())
 	})
 }

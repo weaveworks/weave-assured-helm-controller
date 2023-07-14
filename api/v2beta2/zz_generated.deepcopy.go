@@ -195,17 +195,21 @@ func (in *HelmReleaseInfo) DeepCopyInto(out *HelmReleaseInfo) {
 	in.Deleted.DeepCopyInto(&out.Deleted)
 	if in.TestHooks != nil {
 		in, out := &in.TestHooks, &out.TestHooks
-		*out = make(map[string]*HelmReleaseTestHook, len(*in))
-		for key, val := range *in {
-			var outVal *HelmReleaseTestHook
-			if val == nil {
-				(*out)[key] = nil
-			} else {
-				in, out := &val, &outVal
-				*out = new(HelmReleaseTestHook)
-				(*in).DeepCopyInto(*out)
+		*out = new(map[string]*HelmReleaseTestHook)
+		if **in != nil {
+			in, out := *in, *out
+			*out = make(map[string]*HelmReleaseTestHook, len(*in))
+			for key, val := range *in {
+				var outVal *HelmReleaseTestHook
+				if val == nil {
+					(*out)[key] = nil
+				} else {
+					in, out := &val, &outVal
+					*out = new(HelmReleaseTestHook)
+					(*in).DeepCopyInto(*out)
+				}
+				(*out)[key] = outVal
 			}
-			(*out)[key] = outVal
 		}
 	}
 }
@@ -552,6 +556,11 @@ func (in *Uninstall) DeepCopyInto(out *Uninstall) {
 	if in.Timeout != nil {
 		in, out := &in.Timeout, &out.Timeout
 		*out = new(metav1.Duration)
+		**out = **in
+	}
+	if in.DeletionPropagation != nil {
+		in, out := &in.DeletionPropagation, &out.DeletionPropagation
+		*out = new(string)
 		**out = **in
 	}
 }

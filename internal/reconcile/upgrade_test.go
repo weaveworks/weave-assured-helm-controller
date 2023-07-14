@@ -18,11 +18,11 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/fluxcd/pkg/runtime/conditions"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	helmchart "helm.sh/helm/v3/pkg/chart"
@@ -31,16 +31,24 @@ import (
 	helmreleaseutil "helm.sh/helm/v3/pkg/releaseutil"
 	helmstorage "helm.sh/helm/v3/pkg/storage"
 	helmdriver "helm.sh/helm/v3/pkg/storage/driver"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
+
+	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
+	"github.com/fluxcd/pkg/apis/meta"
+	"github.com/fluxcd/pkg/runtime/conditions"
 
 	v2 "github.com/fluxcd/helm-controller/api/v2beta2"
 	"github.com/fluxcd/helm-controller/internal/action"
+	"github.com/fluxcd/helm-controller/internal/chartutil"
+	"github.com/fluxcd/helm-controller/internal/digest"
 	"github.com/fluxcd/helm-controller/internal/release"
 	"github.com/fluxcd/helm-controller/internal/storage"
 	"github.com/fluxcd/helm-controller/internal/testutil"
 )
 
-func Test_upgrade(t *testing.T) {
+func TestUpgrade_Reconcile(t *testing.T) {
 	var (
 		mockCreateErr = fmt.Errorf("storage create error")
 		mockUpdateErr = fmt.Errorf("storage update error")
@@ -101,8 +109,8 @@ func Test_upgrade(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
-				*conditions.TrueCondition(v2.ReleasedCondition, v2.UpgradeSucceededReason,
-					"Upgrade complete"),
+				*conditions.TrueCondition(meta.ReadyCondition, v2.UpgradeSucceededReason, "Upgraded release"),
+				*conditions.TrueCondition(v2.ReleasedCondition, v2.UpgradeSucceededReason, "Upgraded release"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				return release.ObservedToInfo(release.ObserveRelease(releases[1]))
@@ -131,6 +139,8 @@ func Test_upgrade(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UpgradeFailedReason,
+					"post-upgrade hooks failed: 1 error occurred:\n\t* timed out waiting for the condition\n\n"),
 				*conditions.FalseCondition(v2.ReleasedCondition, v2.UpgradeFailedReason,
 					"post-upgrade hooks failed: 1 error occurred:\n\t* timed out waiting for the condition\n\n"),
 			},
@@ -169,6 +179,8 @@ func Test_upgrade(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UpgradeFailedReason,
+					mockCreateErr.Error()),
 				*conditions.FalseCondition(v2.ReleasedCondition, v2.UpgradeFailedReason,
 					mockCreateErr.Error()),
 			},
@@ -176,7 +188,8 @@ func Test_upgrade(t *testing.T) {
 				return release.ObservedToInfo(release.ObserveRelease(releases[0]))
 			},
 			expectFailures:        1,
-			expectUpgradeFailures: 1,
+			expectUpgradeFailures: 0,
+			wantErr:               mockCreateErr,
 		},
 		{
 			name: "upgrade failure without storage update",
@@ -204,6 +217,8 @@ func Test_upgrade(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.FalseCondition(meta.ReadyCondition, v2.UpgradeFailedReason,
+					mockUpdateErr.Error()),
 				*conditions.FalseCondition(v2.ReleasedCondition, v2.UpgradeFailedReason,
 					mockUpdateErr.Error()),
 			},
@@ -236,8 +251,8 @@ func Test_upgrade(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
-				*conditions.TrueCondition(v2.ReleasedCondition, v2.UpgradeSucceededReason,
-					"Upgrade complete"),
+				*conditions.TrueCondition(meta.ReadyCondition, v2.UpgradeSucceededReason, "Upgraded release"),
+				*conditions.TrueCondition(v2.ReleasedCondition, v2.UpgradeSucceededReason, "Upgraded release"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				return release.ObservedToInfo(release.ObserveRelease(releases[1]))
@@ -275,8 +290,10 @@ func Test_upgrade(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.TrueCondition(meta.ReadyCondition, v2.UpgradeSucceededReason,
+					"Upgraded release"),
 				*conditions.TrueCondition(v2.ReleasedCondition, v2.UpgradeSucceededReason,
-					"Upgrade complete"),
+					"Upgraded release"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				return release.ObservedToInfo(release.ObserveRelease(releases[2]))
@@ -341,7 +358,8 @@ func Test_upgrade(t *testing.T) {
 				cfg.Driver = tt.driver(cfg.Driver)
 			}
 
-			got := (&Upgrade{configFactory: cfg}).Reconcile(context.TODO(), &Request{
+			recorder := new(record.FakeRecorder)
+			got := NewUpgrade(cfg, recorder).Reconcile(context.TODO(), &Request{
 				Object: obj,
 				Chart:  tt.chart,
 				Values: tt.values,
@@ -358,15 +376,15 @@ func Test_upgrade(t *testing.T) {
 			helmreleaseutil.SortByRevision(releases)
 
 			if tt.expectCurrent != nil {
-				g.Expect(obj.Status.Current).To(testutil.Equal(tt.expectCurrent(releases)))
+				g.Expect(obj.GetCurrent()).To(testutil.Equal(tt.expectCurrent(releases)))
 			} else {
-				g.Expect(obj.Status.Current).To(BeNil(), "expected current to be nil")
+				g.Expect(obj.GetCurrent()).To(BeNil(), "expected current to be nil")
 			}
 
 			if tt.expectPrevious != nil {
-				g.Expect(obj.Status.Previous).To(testutil.Equal(tt.expectPrevious(releases)))
+				g.Expect(obj.GetPrevious()).To(testutil.Equal(tt.expectPrevious(releases)))
 			} else {
-				g.Expect(obj.Status.Previous).To(BeNil(), "expected previous to be nil")
+				g.Expect(obj.GetPrevious()).To(BeNil(), "expected previous to be nil")
 			}
 
 			g.Expect(obj.Status.Failures).To(Equal(tt.expectFailures))
@@ -374,4 +392,144 @@ func Test_upgrade(t *testing.T) {
 			g.Expect(obj.Status.UpgradeFailures).To(Equal(tt.expectUpgradeFailures))
 		})
 	}
+}
+
+func TestUpgrade_failure(t *testing.T) {
+	var (
+		obj = &v2.HelmRelease{
+			Spec: v2.HelmReleaseSpec{
+				ReleaseName:     mockReleaseName,
+				TargetNamespace: mockReleaseNamespace,
+			},
+		}
+		chrt = testutil.BuildChart()
+		err  = errors.New("upgrade error")
+	)
+
+	t.Run("records failure", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Upgrade{
+			eventRecorder: recorder,
+		}
+
+		req := &Request{Object: obj.DeepCopy(), Chart: chrt, Values: map[string]interface{}{"foo": "bar"}}
+		r.failure(req, nil, err)
+
+		expectMsg := fmt.Sprintf(fmtUpgradeFailure, mockReleaseNamespace, mockReleaseName, chrt.Name(),
+			chrt.Metadata.Version, err.Error())
+
+		g.Expect(req.Object.Status.Conditions).To(conditions.MatchConditions([]metav1.Condition{
+			*conditions.FalseCondition(v2.ReleasedCondition, v2.UpgradeFailedReason, expectMsg),
+		}))
+		g.Expect(req.Object.Status.Failures).To(Equal(int64(1)))
+		g.Expect(recorder.GetEvents()).To(ConsistOf([]corev1.Event{
+			{
+				Type:    corev1.EventTypeWarning,
+				Reason:  v2.UpgradeFailedReason,
+				Message: expectMsg,
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						eventMetaGroupKey(eventv1.MetaRevisionKey): chrt.Metadata.Version,
+						eventMetaGroupKey(eventv1.MetaTokenKey):    chartutil.DigestValues(digest.Canonical, req.Values).String(),
+					},
+				},
+			},
+		}))
+	})
+
+	t.Run("records failure with logs", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Upgrade{
+			eventRecorder: recorder,
+		}
+		req := &Request{Object: obj.DeepCopy(), Chart: chrt}
+		r.failure(req, mockLogBuffer(5, 10), err)
+
+		expectSubStr := "Last Helm logs"
+		g.Expect(conditions.IsFalse(req.Object, v2.ReleasedCondition)).To(BeTrue())
+		g.Expect(conditions.GetMessage(req.Object, v2.ReleasedCondition)).ToNot(ContainSubstring(expectSubStr))
+
+		events := recorder.GetEvents()
+		g.Expect(events).To(HaveLen(1))
+		g.Expect(events[0].Message).To(ContainSubstring(expectSubStr))
+	})
+}
+
+func TestUpgrade_success(t *testing.T) {
+	var (
+		cur = testutil.BuildRelease(&helmrelease.MockReleaseOptions{
+			Name:      mockReleaseName,
+			Namespace: mockReleaseNamespace,
+			Chart:     testutil.BuildChart(),
+		})
+		obj = &v2.HelmRelease{
+			Status: v2.HelmReleaseStatus{
+				Current: release.ObservedToInfo(release.ObserveRelease(cur)),
+			},
+		}
+	)
+
+	t.Run("records success", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Upgrade{
+			eventRecorder: recorder,
+		}
+
+		req := &Request{
+			Object: obj.DeepCopy(),
+		}
+		r.success(req)
+
+		expectMsg := fmt.Sprintf(fmtUpgradeSuccess,
+			fmt.Sprintf("%s/%s.%d", mockReleaseNamespace, mockReleaseName, obj.Status.Current.Version),
+			fmt.Sprintf("%s@%s", obj.Status.Current.ChartName, obj.Status.Current.ChartVersion))
+
+		g.Expect(req.Object.Status.Conditions).To(conditions.MatchConditions([]metav1.Condition{
+			*conditions.TrueCondition(v2.ReleasedCondition, v2.UpgradeSucceededReason, expectMsg),
+		}))
+		g.Expect(recorder.GetEvents()).To(ConsistOf([]corev1.Event{
+			{
+				Type:    corev1.EventTypeNormal,
+				Reason:  v2.UpgradeSucceededReason,
+				Message: expectMsg,
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						eventMetaGroupKey(eventv1.MetaRevisionKey): obj.Status.Current.ChartVersion,
+						eventMetaGroupKey(eventv1.MetaTokenKey):    obj.Status.Current.ConfigDigest,
+					},
+				},
+			},
+		}))
+	})
+
+	t.Run("records success with TestSuccess=False", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Upgrade{
+			eventRecorder: recorder,
+		}
+
+		obj := obj.DeepCopy()
+		obj.Spec.Test = &v2.Test{Enable: true}
+
+		req := &Request{Object: obj}
+		r.success(req)
+
+		g.Expect(conditions.IsTrue(req.Object, v2.ReleasedCondition)).To(BeTrue())
+
+		cond := conditions.Get(req.Object, v2.TestSuccessCondition)
+		g.Expect(cond).ToNot(BeNil())
+
+		expectMsg := fmt.Sprintf(fmtTestPending,
+			fmt.Sprintf("%s/%s.%d", mockReleaseNamespace, mockReleaseName, obj.Status.Current.Version),
+			fmt.Sprintf("%s@%s", obj.Status.Current.ChartName, obj.Status.Current.ChartVersion))
+		g.Expect(cond.Message).To(Equal(expectMsg))
+	})
 }

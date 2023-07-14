@@ -18,6 +18,7 @@ package v2beta2
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -138,6 +139,8 @@ type HelmReleaseSpec struct {
 
 	// The name of the Kubernetes service account to impersonate
 	// when reconciling this HelmRelease.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
@@ -190,50 +193,6 @@ type HelmReleaseSpec struct {
 	PostRenderers []PostRenderer `json:"postRenderers,omitempty"`
 }
 
-// GetInstall returns the configuration for Helm install actions for the
-// HelmRelease.
-func (in HelmReleaseSpec) GetInstall() Install {
-	if in.Install == nil {
-		return Install{}
-	}
-	return *in.Install
-}
-
-// GetUpgrade returns the configuration for Helm upgrade actions for this
-// HelmRelease.
-func (in HelmReleaseSpec) GetUpgrade() Upgrade {
-	if in.Upgrade == nil {
-		return Upgrade{}
-	}
-	return *in.Upgrade
-}
-
-// GetTest returns the configuration for Helm test actions for this HelmRelease.
-func (in HelmReleaseSpec) GetTest() Test {
-	if in.Test == nil {
-		return Test{}
-	}
-	return *in.Test
-}
-
-// GetRollback returns the configuration for Helm rollback actions for this
-// HelmRelease.
-func (in HelmReleaseSpec) GetRollback() Rollback {
-	if in.Rollback == nil {
-		return Rollback{}
-	}
-	return *in.Rollback
-}
-
-// GetUninstall returns the configuration for Helm uninstall actions for this
-// HelmRelease.
-func (in HelmReleaseSpec) GetUninstall() Uninstall {
-	if in.Uninstall == nil {
-		return Uninstall{}
-	}
-	return *in.Uninstall
-}
-
 // HelmChartTemplate defines the template from which the controller will
 // generate a v1beta2.HelmChart object in the same namespace as the referenced
 // v1.Source.
@@ -268,6 +227,8 @@ type HelmChartTemplateObjectMeta struct {
 // generate a v1beta2.HelmChartSpec object.
 type HelmChartTemplateSpec struct {
 	// The name or path the Helm chart is available at in the SourceRef.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
 	// +required
 	Chart string `json:"chart"`
 
@@ -353,13 +314,6 @@ type HelmChartTemplateVerification struct {
 	SecretRef *meta.LocalObjectReference `json:"secretRef,omitempty"`
 }
 
-// DeploymentAction defines a consistent interface for Install and Upgrade.
-// +kubebuilder:object:generate=false
-type DeploymentAction interface {
-	GetDescription() string
-	GetRemediation() Remediation
-}
-
 // Remediation defines a consistent interface for InstallRemediation and
 // UpgradeRemediation.
 // +kubebuilder:object:generate=false
@@ -368,9 +322,9 @@ type Remediation interface {
 	MustIgnoreTestFailures(bool) bool
 	MustRemediateLastFailure() bool
 	GetStrategy() RemediationStrategy
-	GetFailureCount(hr HelmRelease) int64
+	GetFailureCount(hr *HelmRelease) int64
 	IncrementFailureCount(hr *HelmRelease)
-	RetriesExhausted(hr HelmRelease) bool
+	RetriesExhausted(hr *HelmRelease) bool
 }
 
 // Install holds the configuration for Helm install actions performed for this
@@ -459,11 +413,6 @@ func (in Install) GetTimeout(defaultTimeout metav1.Duration) metav1.Duration {
 	return *in.Timeout
 }
 
-// GetDescription returns a description for the Helm install action.
-func (in Install) GetDescription() string {
-	return "install"
-}
-
 // GetRemediation returns the configured Remediation for the Helm install action.
 func (in Install) GetRemediation() Remediation {
 	if in.Remediation == nil {
@@ -522,7 +471,7 @@ func (in InstallRemediation) GetStrategy() RemediationStrategy {
 }
 
 // GetFailureCount gets the failure count.
-func (in InstallRemediation) GetFailureCount(hr HelmRelease) int64 {
+func (in InstallRemediation) GetFailureCount(hr *HelmRelease) int64 {
 	return hr.Status.InstallFailures
 }
 
@@ -532,7 +481,7 @@ func (in InstallRemediation) IncrementFailureCount(hr *HelmRelease) {
 }
 
 // RetriesExhausted returns true if there are no remaining retries.
-func (in InstallRemediation) RetriesExhausted(hr HelmRelease) bool {
+func (in InstallRemediation) RetriesExhausted(hr *HelmRelease) bool {
 	return in.Retries >= 0 && in.GetFailureCount(hr) > int64(in.Retries)
 }
 
@@ -631,11 +580,6 @@ func (in Upgrade) GetTimeout(defaultTimeout metav1.Duration) metav1.Duration {
 	return *in.Timeout
 }
 
-// GetDescription returns a description for the Helm upgrade action.
-func (in Upgrade) GetDescription() string {
-	return "upgrade"
-}
-
 // GetRemediation returns the configured Remediation for the Helm upgrade
 // action.
 func (in Upgrade) GetRemediation() Remediation {
@@ -703,7 +647,7 @@ func (in UpgradeRemediation) GetStrategy() RemediationStrategy {
 }
 
 // GetFailureCount gets the failure count.
-func (in UpgradeRemediation) GetFailureCount(hr HelmRelease) int64 {
+func (in UpgradeRemediation) GetFailureCount(hr *HelmRelease) int64 {
 	return hr.Status.UpgradeFailures
 }
 
@@ -713,7 +657,7 @@ func (in UpgradeRemediation) IncrementFailureCount(hr *HelmRelease) {
 }
 
 // RetriesExhausted returns true if there are no remaining retries.
-func (in UpgradeRemediation) RetriesExhausted(hr HelmRelease) bool {
+func (in UpgradeRemediation) RetriesExhausted(hr *HelmRelease) bool {
 	return in.Retries >= 0 && in.GetFailureCount(hr) > int64(in.Retries)
 }
 
@@ -764,9 +708,12 @@ func (in Test) GetTimeout(defaultTimeout metav1.Duration) metav1.Duration {
 	return *in.Timeout
 }
 
-// Filters holds the configuration for individual Helm test filters.
+// Filter holds the configuration for individual Helm test filters.
 type Filter struct {
 	// Name is the name of the test.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +required
 	Name string `json:"name"`
 	// Exclude is specifies whether the named test should be excluded.
 	// +optional
@@ -854,6 +801,13 @@ type Uninstall struct {
 	// a Helm uninstall is performed.
 	// +optional
 	DisableWait bool `json:"disableWait,omitempty"`
+
+	// DeletionPropagation specifies the deletion propagation policy when
+	// a Helm uninstall is performed.
+	// +kubebuilder:default=background
+	// +kubebuilder:validation:Enum=background;foreground;orphan
+	// +optional
+	DeletionPropagation *string `json:"deletionPropagation,omitempty"`
 }
 
 // GetTimeout returns the configured timeout for the Helm uninstall action, or
@@ -863,6 +817,15 @@ func (in Uninstall) GetTimeout(defaultTimeout metav1.Duration) metav1.Duration {
 		return defaultTimeout
 	}
 	return *in.Timeout
+}
+
+// GetDeletionPropagation returns the configured deletion propagation policy
+// for the Helm uninstall action, or 'background'.
+func (in Uninstall) GetDeletionPropagation() string {
+	if in.DeletionPropagation == nil {
+		return "background"
+	}
+	return *in.DeletionPropagation
 }
 
 // HelmReleaseInfo holds the status information for a Helm release as performed
@@ -908,7 +871,50 @@ type HelmReleaseInfo struct {
 	// TestHooks is the list of test hooks for the release as observed to be
 	// run by the controller.
 	// +optional
-	TestHooks map[string]*HelmReleaseTestHook `json:"testHooks,omitempty"`
+	TestHooks *map[string]*HelmReleaseTestHook `json:"testHooks,omitempty"`
+}
+
+// FullReleaseName returns the full name of the release in the format
+// of '<namespace>/<name>.<version>
+func (in *HelmReleaseInfo) FullReleaseName() string {
+	return fmt.Sprintf("%s/%s.%d", in.Namespace, in.Name, in.Version)
+}
+
+// VersionedChartName returns the full name of the chart in the format of
+// '<name>@<version>'.
+func (in *HelmReleaseInfo) VersionedChartName() string {
+	return fmt.Sprintf("%s@%s", in.ChartName, in.ChartVersion)
+}
+
+// HasBeenTested returns true if TestHooks is not nil. This includes an empty
+// map, which indicates the chart has no tests.
+func (in *HelmReleaseInfo) HasBeenTested() bool {
+	return in != nil && in.TestHooks != nil
+}
+
+// GetTestHooks returns the TestHooks for the release if not nil.
+func (in *HelmReleaseInfo) GetTestHooks() map[string]*HelmReleaseTestHook {
+	if in == nil {
+		return nil
+	}
+	return *in.TestHooks
+}
+
+// HasTestInPhase returns true if any of the TestHooks is in the given phase.
+func (in *HelmReleaseInfo) HasTestInPhase(phase string) bool {
+	if in != nil {
+		for _, h := range in.GetTestHooks() {
+			if h.Phase == phase {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SetTestHooks sets the TestHooks for the release.
+func (in *HelmReleaseInfo) SetTestHooks(hooks map[string]*HelmReleaseTestHook) {
+	in.TestHooks = &hooks
 }
 
 // HelmReleaseTestHook holds the status information for a test hook as observed
@@ -939,6 +945,14 @@ type HelmReleaseStatus struct {
 	// the controller for the HelmRelease.
 	// +optional
 	HelmChart string `json:"helmChart,omitempty"`
+
+	// StorageNamespace is the namespace of the Helm release storage for the
+	// Current release.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Optional
+	// +optional
+	StorageNamespace string `json:"storageNamespace,omitempty"`
 
 	// Current holds the latest observed HelmReleaseInfo for the current
 	// release.
@@ -1012,6 +1026,84 @@ type HelmRelease struct {
 	Spec HelmReleaseSpec `json:"spec,omitempty"`
 	// +kubebuilder:default:={"observedGeneration":-1}
 	Status HelmReleaseStatus `json:"status,omitempty"`
+}
+
+// GetInstall returns the configuration for Helm install actions for the
+// HelmRelease.
+func (in *HelmRelease) GetInstall() Install {
+	if in.Spec.Install == nil {
+		return Install{}
+	}
+	return *in.Spec.Install
+}
+
+// GetUpgrade returns the configuration for Helm upgrade actions for this
+// HelmRelease.
+func (in *HelmRelease) GetUpgrade() Upgrade {
+	if in.Spec.Upgrade == nil {
+		return Upgrade{}
+	}
+	return *in.Spec.Upgrade
+}
+
+// GetTest returns the configuration for Helm test actions for this HelmRelease.
+func (in *HelmRelease) GetTest() Test {
+	if in.Spec.Test == nil {
+		return Test{}
+	}
+	return *in.Spec.Test
+}
+
+// GetRollback returns the configuration for Helm rollback actions for this
+// HelmRelease.
+func (in *HelmRelease) GetRollback() Rollback {
+	if in.Spec.Rollback == nil {
+		return Rollback{}
+	}
+	return *in.Spec.Rollback
+}
+
+// GetUninstall returns the configuration for Helm uninstall actions for this
+// HelmRelease.
+func (in *HelmRelease) GetUninstall() Uninstall {
+	if in.Spec.Uninstall == nil {
+		return Uninstall{}
+	}
+	return *in.Spec.Uninstall
+}
+
+// GetCurrent returns HelmReleaseStatus.Current.
+func (in HelmRelease) GetCurrent() *HelmReleaseInfo {
+	if in.HasCurrent() {
+		return in.Status.Current
+	}
+	return nil
+}
+
+// HasCurrent returns true if the HelmRelease has a HelmReleaseStatus.Current.
+func (in HelmRelease) HasCurrent() bool {
+	return in.Status.Current != nil
+}
+
+// GetPrevious returns HelmReleaseStatus.Previous.
+func (in HelmRelease) GetPrevious() *HelmReleaseInfo {
+	if in.HasPrevious() {
+		return in.Status.Previous
+	}
+	return nil
+}
+
+// HasPrevious returns true if the HelmRelease has a HelmReleaseStatus.Previous.
+func (in HelmRelease) HasPrevious() bool {
+	return in.Status.Previous != nil
+}
+
+// GetActiveRemediation returns the active Remediation for the HelmRelease.
+func (in HelmRelease) GetActiveRemediation() Remediation {
+	if in.Status.Previous != nil {
+		return in.GetUpgrade().GetRemediation()
+	}
+	return in.GetInstall().GetRemediation()
 }
 
 // GetRequeueAfter returns the duration after which the HelmRelease

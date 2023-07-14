@@ -19,6 +19,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -28,12 +29,18 @@ import (
 	helmreleaseutil "helm.sh/helm/v3/pkg/releaseutil"
 	helmstorage "helm.sh/helm/v3/pkg/storage"
 	helmdriver "helm.sh/helm/v3/pkg/storage/driver"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 
+	eventv1 "github.com/fluxcd/pkg/apis/event/v1beta1"
+	"github.com/fluxcd/pkg/apis/meta"
 	"github.com/fluxcd/pkg/runtime/conditions"
 
 	v2 "github.com/fluxcd/helm-controller/api/v2beta2"
 	"github.com/fluxcd/helm-controller/internal/action"
+	"github.com/fluxcd/helm-controller/internal/chartutil"
+	"github.com/fluxcd/helm-controller/internal/digest"
 	"github.com/fluxcd/helm-controller/internal/release"
 	"github.com/fluxcd/helm-controller/internal/testutil"
 )
@@ -124,12 +131,14 @@ func TestTest_Reconcile(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.TrueCondition(meta.ReadyCondition, v2.TestSucceededReason,
+					"1 test hook completed successfully"),
 				*conditions.TrueCondition(v2.TestSuccessCondition, v2.TestSucceededReason,
-					"1 test hook(s) completed successfully."),
+					"1 test hook completed successfully"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				info := release.ObservedToInfo(release.ObserveRelease(releases[0]))
-				info.TestHooks = release.TestHooksFromRelease(releases[0])
+				info.SetTestHooks(release.TestHooksFromRelease(releases[0]))
 				return info
 			},
 		},
@@ -152,16 +161,19 @@ func TestTest_Reconcile(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.TrueCondition(meta.ReadyCondition, v2.TestSucceededReason,
+					"no test hooks"),
 				*conditions.TrueCondition(v2.TestSuccessCondition, v2.TestSucceededReason,
-					"No test hooks."),
+					"no test hooks"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				info := release.ObservedToInfo(release.ObserveRelease(releases[0]))
+				info.SetTestHooks(release.TestHooksFromRelease(releases[0]))
 				return info
 			},
 		},
 		{
-			name: "test failure",
+			name: "test install failure",
 			releases: func(namespace string) []*helmrelease.Release {
 				return []*helmrelease.Release{
 					testutil.BuildRelease(&helmrelease.MockReleaseOptions{
@@ -175,19 +187,23 @@ func TestTest_Reconcile(t *testing.T) {
 			},
 			status: func(releases []*helmrelease.Release) v2.HelmReleaseStatus {
 				return v2.HelmReleaseStatus{
-					Current: release.ObservedToInfo(release.ObserveRelease(releases[0])),
+					Current:         release.ObservedToInfo(release.ObserveRelease(releases[0])),
+					InstallFailures: 0,
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.FalseCondition(meta.ReadyCondition, v2.TestFailedReason,
+					"timed out waiting for the condition"),
 				*conditions.FalseCondition(v2.TestSuccessCondition, v2.TestFailedReason,
 					"timed out waiting for the condition"),
 			},
 			expectCurrent: func(releases []*helmrelease.Release) *v2.HelmReleaseInfo {
 				info := release.ObservedToInfo(release.ObserveRelease(releases[0]))
-				info.TestHooks = release.TestHooksFromRelease(releases[0])
+				info.SetTestHooks(release.TestHooksFromRelease(releases[0]))
 				return info
 			},
-			expectFailures: 1,
+			expectFailures:        1,
+			expectInstallFailures: 1,
 		},
 		{
 			name: "test without current",
@@ -231,6 +247,8 @@ func TestTest_Reconcile(t *testing.T) {
 				}
 			},
 			expectConditions: []metav1.Condition{
+				*conditions.FalseCondition(meta.ReadyCondition, v2.TestFailedReason,
+					ErrReleaseMismatch.Error()),
 				*conditions.FalseCondition(v2.TestSuccessCondition, v2.TestFailedReason,
 					ErrReleaseMismatch.Error()),
 			},
@@ -238,6 +256,7 @@ func TestTest_Reconcile(t *testing.T) {
 				return release.ObservedToInfo(release.ObserveRelease(releases[0]))
 			},
 			expectFailures: 1,
+			wantErr:        ErrReleaseMismatch,
 		},
 	}
 	for _, tt := range tests {
@@ -263,6 +282,9 @@ func TestTest_Reconcile(t *testing.T) {
 					TargetNamespace:  releaseNamespace,
 					StorageNamespace: releaseNamespace,
 					Timeout:          &metav1.Duration{Duration: 100 * time.Millisecond},
+					Test: &v2.Test{
+						Enable: true,
+					},
 				},
 			}
 			if tt.spec != nil {
@@ -290,7 +312,8 @@ func TestTest_Reconcile(t *testing.T) {
 				cfg.Driver = tt.driver(cfg.Driver)
 			}
 
-			got := (&Test{configFactory: cfg}).Reconcile(context.TODO(), &Request{
+			recorder := new(record.FakeRecorder)
+			got := (NewTest(cfg, recorder)).Reconcile(context.TODO(), &Request{
 				Object: obj,
 			})
 			if tt.wantErr != nil {
@@ -305,15 +328,15 @@ func TestTest_Reconcile(t *testing.T) {
 			helmreleaseutil.SortByRevision(releases)
 
 			if tt.expectCurrent != nil {
-				g.Expect(obj.Status.Current).To(testutil.Equal(tt.expectCurrent(releases)))
+				g.Expect(obj.GetCurrent()).To(testutil.Equal(tt.expectCurrent(releases)))
 			} else {
-				g.Expect(obj.Status.Current).To(BeNil(), "expected current to be nil")
+				g.Expect(obj.GetCurrent()).To(BeNil(), "expected current to be nil")
 			}
 
 			if tt.expectPrevious != nil {
-				g.Expect(obj.Status.Previous).To(testutil.Equal(tt.expectPrevious(releases)))
+				g.Expect(obj.GetPrevious()).To(testutil.Equal(tt.expectPrevious(releases)))
 			} else {
-				g.Expect(obj.Status.Previous).To(BeNil(), "expected previous to be nil")
+				g.Expect(obj.GetPrevious()).To(BeNil(), "expected previous to be nil")
 			}
 
 			g.Expect(obj.Status.Failures).To(Equal(tt.expectFailures))
@@ -343,11 +366,11 @@ func Test_observeTest(t *testing.T) {
 		}, testutil.ReleaseWithHooks(testHookFixtures))
 
 		expect := release.ObservedToInfo(release.ObserveRelease(rls))
-		expect.TestHooks = release.TestHooksFromRelease(rls)
+		expect.SetTestHooks(release.TestHooksFromRelease(rls))
 
 		observeTest(obj)(rls)
-		g.Expect(obj.Status.Current).To(Equal(expect))
-		g.Expect(obj.Status.Previous).To(BeNil())
+		g.Expect(obj.GetCurrent()).To(Equal(expect))
+		g.Expect(obj.GetPrevious()).To(BeNil())
 	})
 
 	t.Run("test with different current version", func(t *testing.T) {
@@ -370,8 +393,8 @@ func Test_observeTest(t *testing.T) {
 		}, testutil.ReleaseWithHooks(testHookFixtures))
 
 		observeTest(obj)(rls)
-		g.Expect(obj.Status.Current).To(Equal(current))
-		g.Expect(obj.Status.Previous).To(BeNil())
+		g.Expect(obj.GetCurrent()).To(Equal(current))
+		g.Expect(obj.GetPrevious()).To(BeNil())
 	})
 
 	t.Run("test without current", func(t *testing.T) {
@@ -386,7 +409,187 @@ func Test_observeTest(t *testing.T) {
 		}, testutil.ReleaseWithHooks(testHookFixtures))
 
 		observeTest(obj)(rls)
-		g.Expect(obj.Status.Current).To(BeNil())
-		g.Expect(obj.Status.Previous).To(BeNil())
+		g.Expect(obj.GetCurrent()).To(BeNil())
+		g.Expect(obj.GetPrevious()).To(BeNil())
+	})
+}
+
+func TestTest_failure(t *testing.T) {
+	var (
+		cur = testutil.BuildRelease(&helmrelease.MockReleaseOptions{
+			Name:      mockReleaseName,
+			Namespace: mockReleaseNamespace,
+			Chart:     testutil.BuildChart(),
+			Version:   4,
+		})
+		obj = &v2.HelmRelease{
+			Status: v2.HelmReleaseStatus{
+				Current: release.ObservedToInfo(release.ObserveRelease(cur)),
+			},
+		}
+		err = errors.New("test error")
+	)
+
+	t.Run("records failure", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Test{
+			eventRecorder: recorder,
+		}
+
+		req := &Request{Object: obj.DeepCopy()}
+		r.failure(req, nil, err)
+
+		expectMsg := fmt.Sprintf(fmtTestFailure,
+			fmt.Sprintf("%s/%s.%d", cur.Namespace, cur.Name, cur.Version),
+			fmt.Sprintf("%s@%s", cur.Chart.Name(), cur.Chart.Metadata.Version),
+			err.Error())
+
+		g.Expect(req.Object.Status.Conditions).To(conditions.MatchConditions([]metav1.Condition{
+			*conditions.FalseCondition(v2.TestSuccessCondition, v2.TestFailedReason, expectMsg),
+		}))
+		g.Expect(req.Object.Status.Failures).To(Equal(int64(1)))
+		g.Expect(req.Object.Status.InstallFailures).To(BeZero())
+		g.Expect(req.Object.Status.UpgradeFailures).To(BeZero())
+		g.Expect(recorder.GetEvents()).To(ConsistOf([]corev1.Event{
+			{
+				Type:    corev1.EventTypeWarning,
+				Reason:  v2.TestFailedReason,
+				Message: expectMsg,
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						eventMetaGroupKey(eventv1.MetaRevisionKey): cur.Chart.Metadata.Version,
+						eventMetaGroupKey(eventv1.MetaTokenKey):    chartutil.DigestValues(digest.Canonical, cur.Config).String(),
+					},
+				},
+			},
+		}))
+	})
+
+	t.Run("records failure with logs", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Test{
+			eventRecorder: recorder,
+		}
+		req := &Request{Object: obj.DeepCopy()}
+		r.failure(req, mockLogBuffer(5, 10), err)
+
+		expectSubStr := "Last Helm logs"
+		g.Expect(conditions.IsFalse(req.Object, v2.TestSuccessCondition)).To(BeTrue())
+		g.Expect(conditions.GetMessage(req.Object, v2.TestSuccessCondition)).ToNot(ContainSubstring(expectSubStr))
+
+		events := recorder.GetEvents()
+		g.Expect(events).To(HaveLen(1))
+		g.Expect(events[0].Message).To(ContainSubstring(expectSubStr))
+	})
+
+	t.Run("increases remediation failure count", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Test{
+			eventRecorder: recorder,
+		}
+
+		obj := obj.DeepCopy()
+		obj.Status.Current.SetTestHooks(map[string]*v2.HelmReleaseTestHook{})
+		req := &Request{Object: obj}
+		r.failure(req, nil, err)
+
+		g.Expect(req.Object.Status.InstallFailures).To(Equal(int64(1)))
+	})
+
+	t.Run("follows ignore failure instructions", func(t *testing.T) {
+		g := NewWithT(t)
+
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Test{
+			eventRecorder: recorder,
+		}
+
+		obj := obj.DeepCopy()
+		obj.Spec.Test = &v2.Test{IgnoreFailures: true}
+		obj.Status.Current.SetTestHooks(map[string]*v2.HelmReleaseTestHook{})
+		req := &Request{Object: obj}
+		r.failure(req, nil, err)
+
+		g.Expect(req.Object.Status.InstallFailures).To(BeZero())
+	})
+}
+
+func TestTest_success(t *testing.T) {
+	g := NewWithT(t)
+
+	var (
+		cur = testutil.BuildRelease(&helmrelease.MockReleaseOptions{
+			Name:      mockReleaseName,
+			Namespace: mockReleaseNamespace,
+			Chart:     testutil.BuildChart(),
+			Version:   4,
+		})
+		obj = &v2.HelmRelease{
+			Status: v2.HelmReleaseStatus{
+				Current: release.ObservedToInfo(release.ObserveRelease(cur)),
+			},
+		}
+	)
+
+	t.Run("records success", func(t *testing.T) {
+		recorder := testutil.NewFakeRecorder(10, false)
+		r := &Test{
+			eventRecorder: recorder,
+		}
+
+		obj := obj.DeepCopy()
+		obj.Status.Current.SetTestHooks(map[string]*v2.HelmReleaseTestHook{
+			"test": {
+				Phase: helmrelease.HookPhaseSucceeded.String(),
+			},
+			"test-2": {
+				Phase: helmrelease.HookPhaseSucceeded.String(),
+			},
+		})
+		req := &Request{Object: obj}
+		r.success(req)
+
+		expectMsg := fmt.Sprintf(fmtTestSuccess,
+			fmt.Sprintf("%s/%s.%d", cur.Namespace, cur.Name, cur.Version),
+			fmt.Sprintf("%s@%s", cur.Chart.Name(), cur.Chart.Metadata.Version),
+			"2 test hooks completed successfully")
+
+		g.Expect(req.Object.Status.Conditions).To(conditions.MatchConditions([]metav1.Condition{
+			*conditions.TrueCondition(v2.TestSuccessCondition, v2.TestSucceededReason, expectMsg),
+		}))
+		g.Expect(req.Object.Status.Failures).To(Equal(int64(0)))
+		g.Expect(recorder.GetEvents()).To(ConsistOf([]corev1.Event{
+			{
+				Type:    corev1.EventTypeNormal,
+				Reason:  v2.TestSucceededReason,
+				Message: expectMsg,
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						eventMetaGroupKey(eventv1.MetaRevisionKey): cur.Chart.Metadata.Version,
+						eventMetaGroupKey(eventv1.MetaTokenKey):    chartutil.DigestValues(digest.Canonical, cur.Config).String(),
+					},
+				},
+			},
+		}))
+	})
+
+	t.Run("records success without hooks", func(t *testing.T) {
+		r := &Test{
+			eventRecorder: new(testutil.FakeRecorder),
+		}
+
+		obj := obj.DeepCopy()
+		obj.Status.Current.SetTestHooks(map[string]*v2.HelmReleaseTestHook{})
+		req := &Request{Object: obj}
+		r.success(req)
+
+		g.Expect(conditions.IsTrue(req.Object, v2.TestSuccessCondition)).To(BeTrue())
+		g.Expect(req.Object.Status.Conditions[0].Message).To(ContainSubstring("no test hooks"))
 	})
 }

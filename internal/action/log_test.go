@@ -17,12 +17,16 @@ limitations under the License.
 package action
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 )
 
 func TestLogBuffer_Log(t *testing.T) {
+	nowTS = stubNowTS
+
 	tests := []struct {
 		name      string
 		size      int
@@ -30,7 +34,7 @@ func TestLogBuffer_Log(t *testing.T) {
 		wantCount int
 		want      string
 	}{
-		{name: "log", size: 2, fill: []string{"a", "b", "c"}, wantCount: 3, want: "b\nc"},
+		{name: "log", size: 2, fill: []string{"a", "b", "c"}, wantCount: 3, want: fmt.Sprintf("%[1]s b\n%[1]s c", stubNowTS().Format(time.RFC3339Nano))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -45,6 +49,30 @@ func TestLogBuffer_Log(t *testing.T) {
 				t.Errorf("Inner Log() called %v times, want %v", count, tt.wantCount)
 			}
 			if got := l.String(); got != tt.want {
+				t.Errorf("String() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLogBuffer_Len(t *testing.T) {
+	tests := []struct {
+		name string
+		size int
+		fill []string
+		want int
+	}{
+		{name: "empty buffer", fill: []string{}, want: 0},
+		{name: "filled buffer", size: 2, fill: []string{"a", "b"}, want: 2},
+		{name: "half full buffer", size: 4, fill: []string{"a", "b"}, want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l := NewLogBuffer(NewDebugLog(logr.Discard()), tt.size)
+			for _, v := range tt.fill {
+				l.Log("%s", v)
+			}
+			if got := l.Len(); got != tt.want {
 				t.Errorf("String() = %v, want %v", got, tt.want)
 			}
 		})
@@ -78,6 +106,8 @@ func TestLogBuffer_Reset(t *testing.T) {
 }
 
 func TestLogBuffer_String(t *testing.T) {
+	nowTS = stubNowTS
+
 	tests := []struct {
 		name string
 		size int
@@ -85,8 +115,11 @@ func TestLogBuffer_String(t *testing.T) {
 		want string
 	}{
 		{name: "empty buffer", fill: []string{}, want: ""},
-		{name: "filled buffer", size: 2, fill: []string{"a", "b", "c"}, want: "b\nc"},
-		{name: "duplicate buffer items", fill: []string{"b", "b", "b"}, want: "b"},
+		{name: "filled buffer", size: 2, fill: []string{"a", "b", "c"}, want: fmt.Sprintf("%[1]s b\n%[1]s c", stubNowTS().Format(time.RFC3339Nano))},
+		{name: "duplicate buffer items", fill: []string{"b", "b"}, want: fmt.Sprintf("%[1]s b\n%[1]s b", stubNowTS().Format(time.RFC3339Nano))},
+		{name: "duplicate buffer items", fill: []string{"b", "b", "b"}, want: fmt.Sprintf("%[1]s b\n%[1]s b (1 duplicate line omitted)", stubNowTS().Format(time.RFC3339Nano))},
+		{name: "duplicate buffer items", fill: []string{"b", "b", "b", "b"}, want: fmt.Sprintf("%[1]s b\n%[1]s b (2 duplicate lines omitted)", stubNowTS().Format(time.RFC3339Nano))},
+		{name: "duplicate buffer items", fill: []string{"a", "b", "b", "b", "c", "c"}, want: fmt.Sprintf("%[1]s a\n%[1]s b\n%[1]s b (1 duplicate line omitted)\n%[1]s c\n%[1]s c", stubNowTS().Format(time.RFC3339Nano))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -99,4 +132,9 @@ func TestLogBuffer_String(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stubNowTS returns a fixed time for testing purposes.
+func stubNowTS() time.Time {
+	return time.Date(2016, 2, 18, 12, 24, 5, 12345600, time.UTC)
 }
