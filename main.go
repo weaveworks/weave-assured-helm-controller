@@ -46,7 +46,7 @@ import (
 	"github.com/fluxcd/pkg/runtime/probes"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1beta2"
 
-	v2 "github.com/fluxcd/helm-controller/api/v2beta1"
+	v2 "github.com/fluxcd/helm-controller/api/v2beta2"
 	// +kubebuilder:scaffold:imports
 
 	"github.com/fluxcd/helm-controller/internal/controller"
@@ -251,13 +251,13 @@ func main() {
 		Config:              mgr.GetConfig(),
 		Scheme:              mgr.GetScheme(),
 		EventRecorder:       eventRecorder,
-		MetricsRecorder:     metricsH.MetricsRecorder,
+		Metrics:             metricsH,
 		NoCrossNamespaceRef: aclOptions.NoCrossNamespaceRefs,
 		ClientOpts:          clientOptions,
 		KubeConfigOpts:      kubeConfigOpts,
 		PollingOpts:         pollingOpts,
 		StatusPoller:        statusPoller,
-		ControllerName:      controllerName,
+		FieldManager:        controllerName,
 	}).SetupWithManager(ctx, mgr, controller.HelmReleaseReconcilerOptions{
 		DependencyRequeueInterval: requeueDependency,
 		HTTPRetry:                 httpRetry,
